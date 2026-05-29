@@ -1,0 +1,25 @@
+# deps
+node_modules/
+.yarn/*
+!.yarn/patches
+
+# build output
+.next/
+out/
+dist/
+.turbo/
+
+# prisma
+packages/db/src/generated/
+
+# env
+.env.*.local
+
+# misc
+.DS_Store
+*.log
+npm-debug.log*
+yarn-error.log
+coverage/
+*.tsbuildinfo
+config.bat

@@ -1,0 +1,31 @@
+{
+  "name": "cadence",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Cadence \u2014 reference build for a consumer AI-music PLG SaaS (Next.js 13 + tRPC v10 + Prisma + Stripe + R2 + Redis).",
+  "packageManager": "yarn@1.22.22",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "node api.js && turbo run build",
+    "dev": "node api.js && turbo run dev --parallel",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "db:generate": "turbo run db:generate",
+    "db:migrate": "yarn workspace @cadence/db migrate:dev",
+    "db:deploy": "yarn workspace @cadence/db migrate:deploy",
+    "stripe:listen": "stripe listen --forward-to localhost:3000/api/webhooks/stripe",
+    "reconcile": "yarn workspace web tsx src/server/billing/reconciliation.ts",
+    "migrate:paddle": "yarn workspace web tsx src/server/billing/migration/paddleToStripe.ts"
+  },
+  "devDependencies": {
+    "prettier": "^3.2.5",
+    "turbo": "^1.13.0",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  }
+}

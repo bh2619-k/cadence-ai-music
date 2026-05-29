@@ -1,0 +1,329 @@
+// Cadence data model.
+//
+// Notes for readers:
+// - Supabase Postgres: app uses the pooled (PgBouncer) URL, migrations use DIRECT_URL.
+// - The billing tables are intentionally provider-agnostic (BillingProvider enum +
+//   parallel paddle*/stripe* columns) so we can run Paddle and Stripe side by side
+//   during the migration and cut over per-subscriber without downtime.
+// - CreditBalance is the source of truth; Redis holds a fast mirror counter that is
+//   reconciled back to this table (see creditService.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth (NextAuth Prisma adapter)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+
+  // IANA tz, captured at signup; drives wall-clock credit refills.
+  timezone String @default("UTC")
+  role     String @default("user")
+
+  stripeCustomerId String? @unique
+  paddleCustomerId String? @unique // legacy, pre-migration
+
+  accounts      Account[]
+  sessions      Session[]
+  subscription  Subscription?
+  creditBalance CreditBalance?
+  ledger        CreditLedger[]
+  assets        Asset[]
+  jobs          GenerationJob[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+enum PlanTier {
+  FREE
+  PRO
+  STUDIO
+}
+
+enum BillingProvider {
+  PADDLE
+  STRIPE
+}
+
+// Mirrors Stripe subscription statuses 1:1 so webhook handlers can map without
+// lossy translation. Paddle states are normalized into these on ingest.
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  UNPAID
+  PAUSED
+}
+
+model Plan {
+  id   String   @id @default(cuid())
+  tier PlanTier @unique
+  name String
+
+  stripePriceIdMonthly String? @unique
+  paddlePlanId         String? @unique // legacy
+
+  // Credit economics.
+  monthlyCredits Int @default(0) // granted at each billing period start
+  dailyRefill    Int @default(0) // topped up each local day
+  rolloverCap    Int @default(0) // max balance carried across a daily refill
+  priceCents     Int @default(0)
+
+  features Json?
+  isActive Boolean @default(true)
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  planId String
+  plan   Plan   @relation(fields: [planId], references: [id])
+
+  provider BillingProvider    @default(STRIPE)
+  status   SubscriptionStatus @default(ACTIVE)
+
+  stripeSubscriptionId String? @unique
+  stripeCustomerId     String?
+  paddleSubscriptionId String? @unique // legacy
+
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean   @default(false)
+  canceledAt         DateTime?
+  trialEndsAt        DateTime?
+  defaultPaymentLast4 String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([currentPeriodEnd])
+  @@index([provider, status])
+}
+
+// ---------------------------------------------------------------------------
+// Credits (double-entry ledger + cached balance)
+// ---------------------------------------------------------------------------
+
+enum LedgerReason {
+  SIGNUP_GRANT
+  DAILY_REFILL
+  MONTHLY_GRANT
+  ROLLOVER_EXPIRE
+  CONSUME
+  PURCHASE
+  REFUND_REVERSAL
+  MIGRATION_BACKFILL
+  ADMIN_ADJUST
+}
+
+model CreditBalance {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  balance        Int @default(0)
+  dailyAllowance Int @default(0)
+  rolloverCap    Int @default(0)
+
+  // 'YYYY-MM-DD' in the user's local tz — makes the daily refill idempotent per
+  // local calendar day regardless of when the cron fires.
+  lastDailyRefillOn String?
+  // Billing period anchor of the last monthly grant; dedupes period grants.
+  lastMonthlyGrantPeriod String?
+
+  updatedAt DateTime @updatedAt
+}
+
+model CreditLedger {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  delta       Int
+  balanceAfter Int
+  reason      LedgerReason
+  // Every mutation carries an idempotency key (e.g. "refill:<userId>:<localDay>"
+  // or "consume:<jobId>"). The unique index is what actually prevents double-spend
+  // and double-grant under webhook/cron retries.
+  idempotencyKey String @unique
+  metadata       Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Webhook idempotency (Stripe + Paddle)
+// ---------------------------------------------------------------------------
+
+model WebhookEvent {
+  // Provider event id (Stripe `evt_...`). Primary key = natural dedupe key.
+  id       String          @id
+  provider BillingProvider
+  type     String
+
+  // processing | processed | failed — claimed atomically before handling.
+  status      String   @default("processing")
+  payloadHash String?
+  attempts    Int      @default(0)
+  error       String?
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([type])
+  @@index([status, receivedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Assets (Cloudflare R2) + inference jobs (Modal)
+// ---------------------------------------------------------------------------
+
+enum AssetKind {
+  TRACK
+  STEM
+  COVER
+  VIDEO
+  UPLOAD
+}
+
+enum AssetVisibility {
+  PRIVATE
+  PUBLIC
+}
+
+enum AssetStatus {
+  PENDING
+  READY
+  REVOKED
+  DELETED
+}
+
+model Asset {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind        AssetKind
+  bucket      String
+  key         String          @unique
+  contentType String?
+  sizeBytes   Int?
+  durationMs  Int?
+  visibility  AssetVisibility @default(PRIVATE)
+  status      AssetStatus     @default(PENDING)
+
+  // Set on refund/chargeback to lock premium downloads without deleting data.
+  accessRevokedAt DateTime?
+
+  jobsOut GenerationJob[] @relation("JobOutput")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, createdAt])
+}
+
+enum JobKind {
+  GENERATE_MUSIC
+  SEPARATE_STEMS
+  VOICE_CONVERT
+  MUSIC_VIDEO
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+model GenerationJob {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind        JobKind
+  status      JobStatus @default(QUEUED)
+  creditsCost Int       @default(0)
+
+  // Dedupes accidental double-submits from the client (idempotent enqueue).
+  idempotencyKey String @unique
+  // Async handle returned by the Modal endpoint; polled until terminal.
+  modalCallId String?
+
+  params Json?
+
+  outputAssetId String? @unique
+  outputAsset   Asset?  @relation("JobOutput", fields: [outputAssetId], references: [id])
+
+  error String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+}
