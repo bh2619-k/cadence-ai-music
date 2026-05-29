@@ -1,0 +1,6 @@
+# Local/reference deps. Modal builds the actual runtime images from app.py
+# (see modal.Image.* there); this file is for editor/tooling parity.
+modal>=0.63
+fastapi>=0.110
+pydantic>=2.6
+boto3>=1.34
